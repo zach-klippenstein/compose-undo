@@ -35,7 +35,7 @@ information.
 This repo includes a demo app you can run and tinker with if you fork the repo. Here's a little
 preview:
 
-TODO
+https://user-images.githubusercontent.com/101754/190877868-160456a2-5bd1-498d-9c76-147fb04958e6.mp4
 
 ## How it works
 
