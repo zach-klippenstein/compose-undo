@@ -64,7 +64,17 @@ fun WithStateHistory(content: @Composable (StateHistory) -> Unit) {
  * 1. Call [setCurrentFrameGlobally] to restore the state of all tracked objects to the states they
  *  had at the given frame, or call the convenience methods [undo]/[redo] to move the frame by one.
  *
- * E.g.:
+ * ## Defining save points
+ *
+ * History frames will only be pushed onto the stack when [safeFrame] is called. You can call this
+ * method whenever you want, so the granularity of the history is up to you. To get the most detail,
+ * call it from the [recordChanges] callback, which will be invoked every time a snapshot is applied
+ * to the global snapshot that changes one or more tracked state objects. If that's too much detail
+ * for your use case, you can pass a null callback to [recordChanges] and call [saveFrame] only
+ * whenever something significant happens in your app, at regular intervals with a timer, etc.
+ *
+ * **Key point: State changes from a single snapshot will always be saved to the same frame.**
+ *
  * @sample WithStateHistory
  */
 @Stable
@@ -134,23 +144,22 @@ class StateHistory {
      * If [currentFrame] is not the last frame, any frames after it will be removed.
      */
     fun saveFrame() {
-        Snapshot.global {
-            Snapshot.withMutableSnapshot {
-                // Take the lock inside the snapshot so we don't conflict with the lock in the
-                // apply observer when the snapshot is applied.
-                synchronized(lock) {
-                    if (DEBUG) println("[$TAG] Recording frame ${currentFrame + 1}: $nextFrame")
-                    // If committing a new frame while peeking into the history, clear the
-                    // frames after this point and start recording fresh.
-                    if (frames.lastIndex > currentFrame) {
-                        frames.removeRange(currentFrame + 1, frames.size)
-                    }
-
-                    frames += nextFrame
-                    nextFrame = WeakHashMap()
-                    frameCount = frames.size
-                    currentFrame = frames.lastIndex
+        // Take the lock outside the snapshot so
+        // This won't conflict with the lock in the apply observer when the snapshot is applied
+        // because the none of the states changed in this snapshot are tracked.
+        synchronized(lock) {
+            withGlobalMutableSnapshot {
+                if (DEBUG) println("[$TAG] Recording frame ${currentFrame + 1}: $nextFrame")
+                // If committing a new frame while peeking into the history, clear the
+                // frames after this point and start recording fresh.
+                if (frames.lastIndex > currentFrame) {
+                    frames.removeRange(currentFrame + 1, frames.size)
                 }
+
+                frames += nextFrame
+                nextFrame = WeakHashMap()
+                frameCount = frames.size
+                currentFrame = frames.lastIndex
             }
         }
     }
@@ -223,36 +232,34 @@ class StateHistory {
         )
 
         // Peeking in non-global snapshots is not currently supported.
-        Snapshot.global {
-            Snapshot.withMutableSnapshot {
-                synchronized(lock) {
-                    @Suppress("NAME_SHADOWING")
-                    val frameIndex = frameIndex.coerceIn(0, frames.lastIndex)
-                    if (DEBUG) println("[$TAG] Setting current frame to $frameIndex")
-                    // Check again after coercing.
-                    if (frameIndex == currentFrame) return
-                    currentFrame = frameIndex
-                    trackedStates.forEach { (stateObject, _) ->
-                        // Find the latest frame containing the state object, if any.
-                        var readFrameIndex = frameIndex
-                        while (readFrameIndex >= 0 && stateObject !in frames[readFrameIndex]) {
-                            readFrameIndex--
-                        }
-
-                        if (readFrameIndex >= 0) {
-                            val frame = frames[readFrameIndex]
-                            val record = frame.getValue(stateObject)
-                            if (DEBUG) println("[$TAG] Restoring $stateObject to $record")
-                            stateObject.restoreFrom(record)
-                        } else if (DEBUG) {
-                            println("[$TAG] Couldn't find value for $stateObject in history")
-                        }
+        synchronized(lock) {
+            withGlobalMutableSnapshot {
+                @Suppress("NAME_SHADOWING")
+                val frameIndex = frameIndex.coerceIn(0, frames.lastIndex)
+                if (DEBUG) println("[$TAG] Setting current frame to $frameIndex")
+                // Check again after coercing.
+                if (frameIndex == currentFrame) return
+                currentFrame = frameIndex
+                trackedStates.forEach { (stateObject, _) ->
+                    // Find the latest frame containing the state object, if any.
+                    var readFrameIndex = frameIndex
+                    while (readFrameIndex >= 0 && stateObject !in frames[readFrameIndex]) {
+                        readFrameIndex--
                     }
 
-                    // When the mutableSnapshot is applied, we'll synchronously get an apply
-                    // observer callback - or we would, if we hadn't stopped recording. After that,
-                    // it's safe to stop recording again.
+                    if (readFrameIndex >= 0) {
+                        val frame = frames[readFrameIndex]
+                        val record = frame.getValue(stateObject)
+                        if (DEBUG) println("[$TAG] Restoring $stateObject to $record")
+                        stateObject.restoreFrom(record)
+                    } else if (DEBUG) {
+                        println("[$TAG] Couldn't find value for $stateObject in history")
+                    }
                 }
+
+                // When the mutableSnapshot is applied, we'll synchronously get an apply
+                // observer callback - or we would, if we hadn't stopped recording. After that,
+                // it's safe to stop recording again.
             }
         }
 
@@ -302,28 +309,60 @@ class StateHistory {
     }
 
     private fun onApply(changedStates: Set<Any>, snapshot: Snapshot) {
-        // Read values inside the snapshot to avoid race conditions.
-        val readSnapshot = snapshot.takeNestedSnapshot()
         var atLeastOneTrackedStateChanged = false
-        try {
-            readSnapshot.enter {
-                synchronized(lock) {
-                    changedStates.forEach { stateObject ->
-                        stateObject as StateObject
-                        if (stateObject in trackedStates) {
-                            atLeastOneTrackedStateChanged = true
-                            nextFrame[stateObject] = stateObject.copyCurrentRecord()
-                        }
+        // Read values inside the snapshot to avoid race conditions.
+        snapshot.withNestedSnapshot {
+            synchronized(lock) {
+                changedStates.forEach { stateObject ->
+                    stateObject as StateObject
+                    if (stateObject in trackedStates) {
+                        atLeastOneTrackedStateChanged = true
+                        nextFrame[stateObject] = stateObject.copyCurrentRecord()
                     }
                 }
             }
-        } finally {
-            readSnapshot.dispose()
         }
 
         if (atLeastOneTrackedStateChanged) {
             if (DEBUG) println("[$TAG] Tracked state changes were applied, invoking callback")
             onTrackStateApplied?.invoke()
+        }
+    }
+
+    private inline fun withGlobalMutableSnapshot(block: () -> Unit) {
+        Snapshot.global {
+            Snapshot.withMutableSnapshot(block)
+        }
+    }
+
+    private inline fun Snapshot.withNestedSnapshot(block: () -> Unit) {
+        takeNestedSnapshot().run {
+            try {
+                enter(block)
+            } finally {
+                dispose()
+            }
+        }
+    }
+
+    /**
+     * Returns a copy of this object's current readable record, without recording a read. The record
+     * is a copy since the original record could be reused at any point in the future.
+     */
+    private fun StateObject.copyCurrentRecord(): StateRecord {
+        val newRecord = firstStateRecord.create()
+        firstStateRecord.withCurrent { current ->
+            newRecord.assign(current)
+        }
+        return newRecord
+    }
+
+    /**
+     * Copies [record] into the write record for this state object in the current snapshot.
+     */
+    private fun StateObject.restoreFrom(record: StateRecord) {
+        firstStateRecord.writable(this) {
+            assign(record)
         }
     }
 
@@ -376,27 +415,6 @@ inline fun <T> SnapshotStateList<T>.trackStateHistory(): SnapshotStateList<T> =
 @Composable
 inline fun <K, V> SnapshotStateMap<K, V>.trackStateHistory(): SnapshotStateMap<K, V> =
     trackStateHistory(this)
-
-/**
- * Returns a copy of this object's current readable record, without recording a read. The record
- * is a copy since the original record could be reused at any point in the future.
- */
-private fun StateObject.copyCurrentRecord(): StateRecord {
-    val newRecord = firstStateRecord.create()
-    firstStateRecord.withCurrent { current ->
-        newRecord.assign(current)
-    }
-    return newRecord
-}
-
-/**
- * Copies [record] into the write record for this state object in the current snapshot.
- */
-private fun StateObject.restoreFrom(record: StateRecord) {
-    firstStateRecord.writable(this) {
-        assign(record)
-    }
-}
 
 @OptIn(ExperimentalContracts::class)
 private fun ensureValidStateObject(stateObject: Any) {
