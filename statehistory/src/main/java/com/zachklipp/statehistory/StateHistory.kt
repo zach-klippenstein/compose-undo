@@ -4,6 +4,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.collection.mutableVectorOf
 import androidx.compose.runtime.snapshots.*
 import kotlinx.coroutines.awaitCancellation
+import java.util.*
 import kotlin.contracts.ExperimentalContracts
 import kotlin.contracts.contract
 
@@ -17,9 +18,8 @@ val LocalStateHistory: ProvidableCompositionLocal<StateHistory?> = staticComposi
  *
  * Inside [content], call [MutableState.trackStateHistory], [SnapshotStateList.trackStateHistory],
  * and [SnapshotStateMap.trackStateHistory] to register state objects for change tracking, or pass
- * them to [StateHistory.startTrackingState] and [StateHistory.stopTrackingState]. Then use the
- * [StateHistory.undo], [StateHistory.redo], and [StateHistory.setCurrentFrameGlobally] methods
- * to restore state.
+ * them to [StateHistory.startTrackingState]. Then use the [StateHistory.undo], [StateHistory.redo],
+ * and [StateHistory.setCurrentFrameGlobally] methods to restore state.
  */
 @Composable
 fun WithStateHistory(content: @Composable (StateHistory) -> Unit) {
@@ -78,7 +78,7 @@ class StateHistory {
     /**
      * The set of all state objects we're currently tracking via [startTrackingState].
      */
-    private val trackedStates = mutableSetOf<StateObject>()
+    private val trackedStates = WeakHashMap<StateObject, Unit>()
     private var handle: ObserverHandle? = null
 
     /**
@@ -86,7 +86,7 @@ class StateHistory {
      * objects are or even what data they hold. The records already implement all the operations
      * we need.
      */
-    private val frames = mutableVectorOf<MutableMap<StateObject, StateRecord>>()
+    private val frames = mutableVectorOf<WeakHashMap<StateObject, StateRecord>>()
 
     /**
      * We "start" recording the next frame as soon as the previous one is committed to the [frames]
@@ -94,7 +94,7 @@ class StateHistory {
      * [startTrackingState] so that their initial values will be saved on the next frame, even if
      * they're not recorded as changed. Maybe unnecessary?
      */
-    private var nextFrame = mutableMapOf<StateObject, StateRecord>()
+    private var nextFrame = WeakHashMap<StateObject, StateRecord>()
 
     private var onTrackStateApplied: (() -> Unit)? = null
 
@@ -147,7 +147,7 @@ class StateHistory {
                     }
 
                     frames += nextFrame
-                    nextFrame = mutableMapOf()
+                    nextFrame = WeakHashMap()
                     frameCount = frames.size
                     currentFrame = frames.lastIndex
                 }
@@ -160,18 +160,20 @@ class StateHistory {
      * the next frame, i.e. the next time the global snapshot is applied while
      * [recording][startRecording].
      *
-     * All objects passed to this method must eventually be passed to [stopTrackingState] to avoid
-     * leaking.
+     * Calling [stopTrackingState] after this method is optional. If it's not called, the history
+     * for the state object will be cleaned up when it's garbage collected.
      *
      * @param stateObject Must be a snapshot state object, such as a [MutableState],
      * [SnapshotStateList], etc. The concrete object must implement [StateObject].
      */
     fun <S : Any> startTrackingState(stateObject: S) {
         ensureValidStateObject(stateObject)
+        if (stateObject in trackedStates) return
+
         // Record the initial state of the object in the next frame to be committed.
         val initialRecord = stateObject.copyCurrentRecord()
         synchronized(lock) {
-            trackedStates += stateObject
+            trackedStates[stateObject] = Unit
             nextFrame[stateObject] = initialRecord
         }
         if (DEBUG) println(
@@ -181,6 +183,9 @@ class StateHistory {
 
     /**
      * Stops tracking changes to [stateObject].
+     *
+     * Calling this method after [startTrackingState] is optional. If it's not called, the history
+     * for the state object will be cleaned up when it's garbage collected.
      */
     fun stopTrackingState(stateObject: Any) {
         stateObject as StateObject
@@ -227,12 +232,13 @@ class StateHistory {
                     // Check again after coercing.
                     if (frameIndex == currentFrame) return
                     currentFrame = frameIndex
-                    trackedStates.forEach { stateObject ->
+                    trackedStates.forEach { (stateObject, _) ->
                         // Find the latest frame containing the state object, if any.
                         var readFrameIndex = frameIndex
                         while (readFrameIndex >= 0 && stateObject !in frames[readFrameIndex]) {
                             readFrameIndex--
                         }
+
                         if (readFrameIndex >= 0) {
                             val frame = frames[readFrameIndex]
                             val record = frame.getValue(stateObject)

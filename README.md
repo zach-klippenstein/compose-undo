@@ -21,8 +21,7 @@ fun App() {
 ```
 
 The key is to call `trackStateChanges` on every snapshot state object you want to track. If you're
-creating state objects outside a composition, call `StateHistory.startTrackingState` and
-`stopTrackingState` yourself.
+creating state objects outside a composition, call `StateHistory.startTrackingState` yourself.
 
 ## Advanced usage
 
