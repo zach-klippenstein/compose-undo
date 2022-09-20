@@ -1,8 +1,12 @@
-# compose-undo
+# compose-undo ![Maven Central](https://img.shields.io/maven-central/v/com.zachklipp.compose-undo/statehistory)
 
 Track changes to any snapshot state object and restore state from any point in the past.
 
 ## Usage
+
+```groovy
+implementation 'com.zachklipp.compose-undo:statehistory:{version}'
+```
 
 The simplest way to get started is to use the `WithStateHistory` composable:
 
